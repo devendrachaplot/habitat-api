@@ -28,6 +28,7 @@ OBSERVATION_SPACE_COMMAND = "observation_space"
 ACTION_SPACE_COMMAND = "action_space"
 CALL_COMMAND = "call"
 EPISODE_COMMAND = "current_episode"
+GET_SHORT_TERM_GOAL = "get_short_term_goal"
 
 
 def _make_env_fn(
@@ -120,6 +121,8 @@ class VectorEnv:
         self.action_spaces = [
             read_fn() for read_fn in self._connection_read_fns
         ]
+        self.observation_space = self.observation_spaces[0]
+        self.action_space = self.action_spaces[0]
         self._paused = []
 
     @property
@@ -156,8 +159,13 @@ class VectorEnv:
                         # habitat.RLEnv
                         observations, reward, done, info = env.step(data)
                         if auto_reset_done and done:
-                            observations = env.reset()
+                            observations, info_new = env.reset()
+                            if 'exp_reward' in info.keys():
+                                info_new['exp_reward'] = info['exp_reward']
+                                info_new['exp_ratio'] = info['exp_ratio']
+                            info = info_new
                         connection_write_fn((observations, reward, done, info))
+
                     elif isinstance(env, habitat.Env):
                         # habitat.Env
                         observations = env.step(data)
@@ -191,6 +199,9 @@ class VectorEnv:
                 # TODO: update CALL_COMMAND for getting attribute like this
                 elif command == EPISODE_COMMAND:
                     connection_write_fn(env.current_episode)
+                elif command == GET_SHORT_TERM_GOAL:
+                    output = env.get_short_term_goal(data)
+                    connection_write_fn(output)
                 else:
                     raise NotImplementedError
 
@@ -258,8 +269,10 @@ class VectorEnv:
         results = []
         for read_fn in self._connection_read_fns:
             results.append(read_fn())
+        obs, infos = zip(*results)
+
         self._is_waiting = False
-        return results
+        return np.stack(obs), infos
 
     def reset_at(self, index_env: int):
         r"""Reset in the index_env environment in the vector.
@@ -292,7 +305,7 @@ class VectorEnv:
         self._is_waiting = False
         return results
 
-    def async_step(self, actions: List[int]) -> None:
+    def step_async(self, actions: List[int]) -> None:
         r"""Asynchronously step in the environments.
 
         Args:
@@ -302,14 +315,15 @@ class VectorEnv:
         for write_fn, action in zip(self._connection_write_fns, actions):
             write_fn((STEP_COMMAND, action))
 
-    def wait_step(self) -> List[Observations]:
+    def step_wait(self) -> List[Observations]:
         r"""Wait until all the asynchronized environments have synchronized.
         """
-        observations = []
+        results = []
         for read_fn in self._connection_read_fns:
-            observations.append(read_fn())
+            results.append(read_fn())
         self._is_waiting = False
-        return observations
+        obs, rews, dones, infos = zip(*results)
+        return np.stack(obs), np.stack(rews), np.stack(dones), infos
 
     def step(self, actions: List[int]):
         r"""Perform actions in the vectorized environments.
@@ -321,8 +335,9 @@ class VectorEnv:
         Returns:
             list of outputs from the step method of envs.
         """
-        self.async_step(actions)
-        return self.wait_step()
+        self.step_async(actions)
+        x = self.step_wait()
+        return x
 
     def close(self) -> None:
         if self._is_closed:
@@ -450,6 +465,20 @@ class VectorEnv:
         else:
             raise NotImplementedError
 
+    def get_short_term_goal(self, inputs):
+        self._assert_not_closed()
+        self._is_waiting = True
+        for e, write_fn in enumerate(self._connection_write_fns):
+            write_fn((GET_SHORT_TERM_GOAL, inputs[e]))
+        results = []
+        for read_fn in self._connection_read_fns:
+            results.append(read_fn())
+        self._is_waiting = False
+        return np.stack(results)
+
+    def _assert_not_closed(self):
+        assert not self._is_closed, "Trying to operate on a SubprocVecEnv after calling close()"
+
     @property
     def _valid_start_methods(self) -> Set[str]:
         return {"forkserver", "spawn", "fork"}
@@ -501,3 +530,4 @@ class ThreadedVectorEnv(VectorEnv):
             [q.get for q in parent_read_queues],
             [q.put for q in parent_write_queues],
         )
+
